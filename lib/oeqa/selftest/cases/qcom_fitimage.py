@@ -77,9 +77,10 @@ class QcomFitImageTests(OESelftestTestCase):
         Args:
             kernel_devicetree: Space-separated DTB/DTBO filenames
                 (the value of KERNEL_DEVICETREE).
-            fit_dtb_compatible: Dict mapping DTB keys (with optional '+'
-                for overlay combos) to compatible string(s)
-                (the FIT_DTB_COMPATIBLE flags).
+            fit_dtb_compatible: Dict mapping encoded compatible strings
+                (commas replaced with underscores, e.g. ``"qcom_board-iot"``)
+                to DTB+overlay combo strings (e.g. ``"board"`` or
+                ``"board overlay"``). (the FIT_DTB_COMPATIBLE flags)
 
         Returns:
             (its_path, parsed) where *parsed* is the dict returned by
@@ -112,20 +113,32 @@ class QcomFitImageTests(OESelftestTestCase):
         dtb_keys_list = {os.path.splitext(f)[0].replace(',', '_')
                          for f in files_set}
 
+        base_compats = {}   # base_dtb_id -> space-separated compat string(s)
         overlay_groups = {}
         overlay_compats = {}
-        for key, compat_val in fit_dtb_compatible.items():
-            if '+' not in key:
-                continue
-            parts = [os.path.basename(p) for p in key.split('+')]
+        seen_combos = set()  # track overlay combos already added to overlay_groups
+        for encoded_key, combo_val in fit_dtb_compatible.items():
+            compat_str = encoded_key.replace('_', ',')
+            parts = [os.path.basename(p) for p in combo_val.split()]
             if not parts:
                 continue
             if not all(dtb in dtb_keys_list for dtb in parts):
                 continue
             base = parts[0] + ".dtb"
+            base_dtb_id = base.replace(',', '_')
             overlays = [ovl + ".dtbo" for ovl in parts[1:]]
-            overlay_groups.setdefault(base, []).append(overlays)
-            overlay_compats[key] = compat_val
+            if overlays:
+                # Mirror the bbclass: encode commas so combo_key/overlay_groups
+                # keys match the lookup_key in fitimage_emit_section_qcomconfig.
+                combo_key = " ".join(p.replace(',', '_') for p in parts)
+                if combo_key not in seen_combos:
+                    overlay_groups.setdefault(base_dtb_id, []).append(overlays)
+                    seen_combos.add(combo_key)
+                existing = overlay_compats.get(combo_key, "")
+                overlay_compats[combo_key] = (existing + " " + compat_str).strip()
+            else:
+                existing = base_compats.get(base_dtb_id, "")
+                base_compats[base_dtb_id] = (existing + " " + compat_str).strip()
 
         # ---- emit image nodes (sorted for deterministic output) ----
         for fname in sorted(files_set):
@@ -134,8 +147,7 @@ class QcomFitImageTests(OESelftestTestCase):
             dtb_id = fname.replace(',', '_')
             compatible = ""
             if fname.endswith(".dtb"):
-                dtb_key = os.path.splitext(dtb_id)[0]
-                compatible = fit_dtb_compatible.get(dtb_key, "")
+                compatible = base_compats.get(dtb_id, "")
             root_node.fitimage_emit_section_dtb(
                 dtb_id, fpath,
                 compatible_str=compatible, dtb_type="flat_dt")
@@ -239,7 +251,7 @@ class QcomFitImageTests(OESelftestTestCase):
         """Single DTB with one compatible string."""
         _, p = self._build_qcom_fitimage(
             "myboard.dtb",
-            {"myboard": "qcom,myboard-idp"})
+            {"qcom_myboard-idp": "myboard"})
 
         # Images
         self.assertIn('fdt-qcom-metadata.dtb', p['images'])
@@ -262,7 +274,10 @@ class QcomFitImageTests(OESelftestTestCase):
         """Single DTB with multiple compatibles -> one config per compat."""
         _, p = self._build_qcom_fitimage(
             "qcs6490-rb3gen2.dtb",
-            {"qcs6490-rb3gen2": "qcom,qcs5430-iot qcom,qcs6490-iot"})
+            {
+                "qcom_qcs5430-iot": "qcs6490-rb3gen2",
+                "qcom_qcs6490-iot": "qcs6490-rb3gen2",
+            })
 
         self.assertEqual(len(p['images']), 2)   # metadata + 1 DTB
         self.assertEqual(len(p['configurations']), 2)
@@ -283,8 +298,8 @@ class QcomFitImageTests(OESelftestTestCase):
         _, p = self._build_qcom_fitimage(
             "qcs6490-rb3gen2.dtb qcs6490-rb3gen2-vision-mezzanine.dtbo",
             {
-                "qcs6490-rb3gen2": "qcom,qcs6490-iot",
-                "qcs6490-rb3gen2+qcs6490-rb3gen2-vision-mezzanine": "qcom,qcs6490-iot-subtype2",
+                "qcom_qcs6490-iot": "qcs6490-rb3gen2",
+                "qcom_qcs6490-iot-subtype2": "qcs6490-rb3gen2 qcs6490-rb3gen2-vision-mezzanine",
             })
 
         self.assertEqual(len(p['images']), 3)
@@ -315,10 +330,11 @@ class QcomFitImageTests(OESelftestTestCase):
             "lemans-evk.dtb lemans-evk-camx.dtbo "
             "lemans-el2.dtbo lemans-camx-el2.dtbo",
             {
-                "lemans-evk": "qcom,qcs9075-iot",
-                "lemans-evk+lemans-evk-camx+lemans-el2+lemans-camx-el2":
-                    "qcom,qcs9075-iot-camx-el2kvm "
-                    "qcom,qcs9075-socv2.0-iot-camx-el2kvm",
+                "qcom_qcs9075-iot": "lemans-evk",
+                "qcom_qcs9075-iot-camx-el2kvm":
+                    "lemans-evk lemans-evk-camx lemans-el2 lemans-camx-el2",
+                "qcom_qcs9075-socv2.0-iot-camx-el2kvm":
+                    "lemans-evk lemans-evk-camx lemans-el2 lemans-camx-el2",
             })
 
         self.assertEqual(len(p['images']), 5)
@@ -352,7 +368,7 @@ class QcomFitImageTests(OESelftestTestCase):
         """Metadata DTB appears as image (type=qcom_metadata) but never in configs."""
         _, p = self._build_qcom_fitimage(
             "simple.dtb",
-            {"simple": "qcom,simple-evk"})
+            {"qcom_simple-evk": "simple"})
 
         meta = p['images'].get('fdt-qcom-metadata.dtb')
         self.assertIsNotNone(meta, "Metadata image node missing")
@@ -369,8 +385,8 @@ class QcomFitImageTests(OESelftestTestCase):
         _, p = self._build_qcom_fitimage(
             "base.dtb",            # overlay DTBO not listed
             {
-                "base": "qcom,base-iot",
-                "base+missing-overlay": "qcom,base-iot-subtype2",
+                "qcom_base-iot": "base",
+                "qcom_base-iot-subtype2": "base missing-overlay",
             })
 
         # Only 1 config (base); overlay combo silently dropped
@@ -385,9 +401,9 @@ class QcomFitImageTests(OESelftestTestCase):
         _, p = self._build_qcom_fitimage(
             "board.dtb camx.dtbo el2.dtbo",
             {
-                "board": "qcom,board-iot",
-                "board+camx": "qcom,board-iot-subtype2",
-                "board+camx+el2": "qcom,board-iot-el2kvm",
+                "qcom_board-iot": "board",
+                "qcom_board-iot-subtype2": "board camx",
+                "qcom_board-iot-el2kvm": "board camx el2",
             })
 
         self._assert_fdt_linkage(p)
@@ -402,10 +418,12 @@ class QcomFitImageTests(OESelftestTestCase):
         _, p = self._build_qcom_fitimage(
             "qcs6490-rb3gen2.dtb qcs6490-rb3gen2-vision-mezzanine.dtbo",
             {
-                "qcs6490-rb3gen2":
-                    "qcom,qcs6490-iot qcom,qcs5430-iot",
-                "qcs6490-rb3gen2+qcs6490-rb3gen2-vision-mezzanine":
-                    "qcom,qcs6490-iot-subtype2 qcom,qcs5430-iot-subtype2",
+                "qcom_qcs6490-iot": "qcs6490-rb3gen2",
+                "qcom_qcs5430-iot": "qcs6490-rb3gen2",
+                "qcom_qcs6490-iot-subtype2":
+                    "qcs6490-rb3gen2 qcs6490-rb3gen2-vision-mezzanine",
+                "qcom_qcs5430-iot-subtype2":
+                    "qcs6490-rb3gen2 qcs6490-rb3gen2-vision-mezzanine",
             })
 
         all_valid = self.METADATA_SUFFIXES | self.COMPAT_EXTENSIONS
@@ -424,9 +442,9 @@ class QcomFitImageTests(OESelftestTestCase):
         _, p = self._build_qcom_fitimage(
             "base.dtb overlay1.dtbo overlay2.dtbo",
             {
-                "base": "qcom,base-iot",
-                "base+overlay1": "qcom,base-iot-subtype1",
-                "base+overlay2": "qcom,base-iot-subtype2",
+                "qcom_base-iot": "base",
+                "qcom_base-iot-subtype1": "base overlay1",
+                "qcom_base-iot-subtype2": "base overlay2",
             })
 
         for cname, cprops in p['configurations'].items():
@@ -443,10 +461,10 @@ class QcomFitImageTests(OESelftestTestCase):
         _, p = self._build_qcom_fitimage(
             "boardA.dtb boardA-cam.dtbo boardB.dtb boardB-cam.dtbo",
             {
-                "boardA": "qcom,boardA-iot",
-                "boardA+boardA-cam": "qcom,boardA-iot-subtype2",
-                "boardB": "qcom,boardB-idp",
-                "boardB+boardB-cam": "qcom,boardB-idp-subtype2",
+                "qcom_boardA-iot": "boardA",
+                "qcom_boardA-iot-subtype2": "boardA boardA-cam",
+                "qcom_boardB-idp": "boardB",
+                "qcom_boardB-idp-subtype2": "boardB boardB-cam",
             })
 
         self.assertEqual(len(p['images']), 5)  # metadata + 2×(base+ovl)
@@ -479,8 +497,8 @@ class QcomFitImageTests(OESelftestTestCase):
         _, p = self._build_qcom_fitimage(
             "base.dtb overlay.dtbo",
             {
-                # No "base" key – the DTB is only referenced through overlays
-                "base+overlay": "qcom,base-iot-subtype2",
+                # No standalone base entry – the DTB is only referenced via overlays
+                "qcom_base-iot-subtype2": "base overlay",
             })
 
         # Only 1 config (the overlay combo), no base-only config
@@ -499,8 +517,8 @@ class QcomFitImageTests(OESelftestTestCase):
         its_path, p = self._build_qcom_fitimage(
             "testboard.dtb testboard-cam.dtbo",
             {
-                "testboard": "qcom,testboard-iot",
-                "testboard+testboard-cam": "qcom,testboard-iot-subtype2",
+                "qcom_testboard-iot": "testboard",
+                "qcom_testboard-iot-subtype2": "testboard testboard-cam",
             })
 
         # Build u-boot-tools-native (mkimage/dumpimage) and dtc-native
@@ -817,3 +835,395 @@ class QcomFitImageIntegrationTests(OESelftestTestCase):
                 self.assertTrue(fdt.endswith('.dtb'),
                     f"Config {cname}: standalone fdt '{fdt}' must "
                     f"be a .dtb, not a .dtbo")
+
+
+class QcomFitImageMatrixTests(OESelftestTestCase):
+    """Matrix tests validating DTB/FIT coverage across machines/providers.
+
+    These tests avoid full image builds by using bitbake metadata expansion
+    (bitbake -e via get_bb_vars) plus kernel source unpack. This validates:
+      - KERNEL_DEVICETREE values resolve for each MACHINE/provider pair
+      - DTBs/DTBOs declared by machine metadata exist in kernel source trees
+      - LINUX_QCOM_KERNEL_DEVICETREE entries are present in qcom kernels
+      - Every FIT_DTB_COMPATIBLE key matches at least one MACHINE/provider DTB set
+    """
+
+    KERNEL_PROVIDER_YOCTO = "linux-yocto"
+    KERNEL_PROVIDERS_QCOM = ("linux-qcom-next", "linux-qcom")
+
+    _provider_outputs_cache = {}
+    _provider_machine_cache = {}
+    _available_providers_cache = None
+    _matrix_cache = None
+    _layer_dir_cache = None
+
+    @classmethod
+    def _layer_dir(cls):
+        """Return the meta-qcom layer directory using LAYERDIR_qcom from bitbake."""
+        if cls._layer_dir_cache is not None:
+            return cls._layer_dir_cache
+        bb_vars = get_bb_vars(["LAYERDIR_qcom"], "virtual/kernel")
+        layerdir = bb_vars.get("LAYERDIR_qcom")
+        if not layerdir:
+            raise AssertionError("LAYERDIR_qcom is not defined")
+        cls._layer_dir_cache = layerdir
+        return cls._layer_dir_cache
+
+    @staticmethod
+    def _dt_files(var_value):
+        return {os.path.basename(x) for x in (var_value or "").split() if x}
+
+    @staticmethod
+    def _dt_keys_from_files(files):
+        return {os.path.splitext(f)[0].replace(',', '_') for f in files}
+
+    def _machine_list(self):
+        machine_dir = os.path.join(self._layer_dir(), "conf", "machine")
+        machines = []
+        for name in sorted(os.listdir(machine_dir)):
+            if name.endswith(".conf"):
+                machines.append(name[:-5])  # strip ".conf"
+        return machines
+
+    def _fit_compatible_inc(self):
+        return os.path.join(
+            self._layer_dir(), "conf", "machine", "include",
+            "fit-dtb-compatible.inc")
+
+    def _linux_qcom_fit_compat_inc(self):
+        return os.path.join(
+            self._layer_dir(), "conf", "machine", "include",
+            "fit-dtb-compatible-linux-qcom.inc")
+
+    @staticmethod
+    def _parse_fit_compatible_map(inc_path):
+        """Parse a fit-dtb-compatible*.inc file into {encoded_compat: dtb_combo}.
+
+        Each key is an encoded compatible string (commas replaced with
+        underscores, e.g. ``"qcom_board-iot"``) and each value is the
+        corresponding DTB+overlay combo string (e.g. ``"board"`` or
+        ``"board overlay"``).  Handles both single-line and
+        backslash-continued multi-line values.  Comment lines are skipped.
+        """
+        with open(inc_path) as f:
+            content = f.read()
+        content = content.replace('\\\n', ' ')
+        content = '\n'.join(
+            l for l in content.split('\n') if not l.lstrip().startswith('#'))
+        result = {}
+        for m in re.finditer(
+                r'FIT_DTB_COMPATIBLE\[([^\]]+)\]\s*=\s*"([^"]*)"', content):
+            key = m.group(1).strip()
+            result[key] = m.group(2).strip()
+        return result
+
+    def _fit_compatible_map(self):
+        """Return the base FIT_DTB_COMPATIBLE map (fit-dtb-compatible.inc only).
+
+        Returns {encoded_compat: dtb_combo_str}.
+        """
+        return self._parse_fit_compatible_map(self._fit_compatible_inc())
+
+    @staticmethod
+    def _name_variants(name):
+        return {
+            name,
+            name.replace('_', ','),
+            name.replace(',', '_'),
+        }
+
+    def _has_dt_output(self, output_files, part_name, exts):
+        for variant in self._name_variants(part_name):
+            for ext in exts:
+                if f"{variant}{ext}" in output_files:
+                    return True
+        return False
+
+    def _provider_output_files(self, provider):
+        """Return set of DTB/DTBO output filenames available in provider source."""
+        if provider in self.__class__._provider_outputs_cache:
+            return self.__class__._provider_outputs_cache[provider]
+
+        machine = self._provider_machine(provider)
+        self.assertIsNotNone(machine,
+            f"Could not find a MACHINE compatible with provider {provider}")
+        postconfig = '\n'.join([
+            f'MACHINE = "{machine}"',
+            f'PREFERRED_PROVIDER_virtual/kernel = "{provider}"',
+        ])
+
+        # Lightweight: unpack kernel source once (no compile/image build).
+        bitbake("virtual/kernel -c unpack", postconfig=postconfig)
+        bb_vars = get_bb_vars(["S"], "virtual/kernel", postconfig=postconfig)
+        src_dir = bb_vars.get("S") or ""
+        self.assertTrue(src_dir and os.path.isdir(src_dir),
+            f"Could not resolve source directory (S) for {provider}")
+
+        # Search in architecture-specific directories for DTS/DTSO files.
+        arch_paths = (
+            os.path.join(src_dir, "arch", "arm64", "boot", "dts"),
+            os.path.join(src_dir, "arch", "arm", "boot", "dts"),
+        )
+
+        outputs = set()
+        for dts_dir in arch_paths:
+            if not os.path.isdir(dts_dir):
+                continue
+            for _, _, files in os.walk(dts_dir):
+                for fname in files:
+                    if fname.endswith(".dts"):
+                        outputs.add(os.path.splitext(fname)[0] + ".dtb")
+                    elif fname.endswith(".dtso"):
+                        outputs.add(os.path.splitext(fname)[0] + ".dtbo")
+
+        self.__class__._provider_outputs_cache[provider] = outputs
+        return outputs
+
+    def _provider_machine(self, provider):
+        if provider in self.__class__._provider_machine_cache:
+            return self.__class__._provider_machine_cache[provider]
+
+        for machine in self._machine_list():
+            try:
+                self._resolve_machine_provider(machine, provider)
+                self.__class__._provider_machine_cache[provider] = machine
+                return machine
+            except AssertionError:
+                continue
+
+        self.__class__._provider_machine_cache[provider] = None
+        return None
+
+    def _available_providers(self):
+        if self.__class__._available_providers_cache is not None:
+            return self.__class__._available_providers_cache
+
+        providers = []
+        for provider in (self.KERNEL_PROVIDER_YOCTO,) + self.KERNEL_PROVIDERS_QCOM:
+            result = runCmd(
+                f"bitbake-layers show-recipes {provider}",
+                ignore_status=True,
+                assert_error=False,
+            )
+            if f"{provider}:" in result.output:
+                providers.append(provider)
+
+        self.__class__._available_providers_cache = providers
+        return providers
+
+    def _resolve_machine_provider(self, machine, provider):
+        postconfig = '\n'.join([
+            f'MACHINE = "{machine}"',
+            f'PREFERRED_PROVIDER_virtual/kernel = "{provider}"',
+        ])
+        bb_vars = get_bb_vars(
+            ["KERNEL_DEVICETREE", "LINUX_QCOM_KERNEL_DEVICETREE"],
+            "virtual/kernel",
+            postconfig=postconfig,
+        )
+        dt_files = self._dt_files(bb_vars.get("KERNEL_DEVICETREE"))
+        extra_files = self._dt_files(bb_vars.get("LINUX_QCOM_KERNEL_DEVICETREE"))
+        return {
+            "machine": machine,
+            "provider": provider,
+            "dt_files": dt_files,
+            "dt_keys": self._dt_keys_from_files(dt_files),
+            "extra_files": extra_files,
+        }
+
+    def _resolve_qcom_provider(self, machine):
+        last_error = None
+        available = set(self._available_providers())
+        for provider in self.KERNEL_PROVIDERS_QCOM:
+            if provider not in available:
+                continue
+            try:
+                return self._resolve_machine_provider(machine, provider)
+            except AssertionError as exc:
+                last_error = exc
+        raise AssertionError(
+            f"Could not resolve qcom kernel provider for {machine}: {last_error}")
+
+    def _matrix(self):
+        if self.__class__._matrix_cache is not None:
+            return self.__class__._matrix_cache
+
+        matrix = []
+        for machine in self._machine_list():
+            try:
+                yocto = self._resolve_machine_provider(
+                    machine, self.KERNEL_PROVIDER_YOCTO)
+                matrix.append(yocto)
+            except AssertionError:
+                # Some machines are intentionally not compatible with
+                # linux-yocto; validate them through qcom kernels only.
+                pass
+            qcom = self._resolve_qcom_provider(machine)
+            matrix.append(qcom)
+        self.__class__._matrix_cache = matrix
+        return matrix
+
+    def test_machine_dtb_entries_exist_for_kernel_providers(self):
+        """Validate machine DTB metadata against linux-yocto and qcom kernels."""
+        available = set(self._available_providers())
+        qcom_available = [p for p in self.KERNEL_PROVIDERS_QCOM if p in available]
+        self.assertGreater(len(qcom_available), 0,
+            "No qcom kernel provider available (linux-qcom-next/linux-qcom)")
+
+        yocto_outputs = self._provider_output_files(self.KERNEL_PROVIDER_YOCTO)
+
+        qcom_outputs = {p: self._provider_output_files(p) for p in qcom_available}
+
+        errors = []
+        yocto_warnings = []
+        for machine in self._machine_list():
+            yocto = None
+            try:
+                yocto = self._resolve_machine_provider(
+                    machine, self.KERNEL_PROVIDER_YOCTO)
+            except AssertionError:
+                # Some machines are intentionally not compatible with
+                # linux-yocto; validate them through qcom kernels only.
+                yocto = None
+            qcom = self._resolve_qcom_provider(machine)
+
+            if yocto is not None:
+                yocto_base_files = yocto["dt_files"] - yocto["extra_files"]
+                missing_yocto = sorted(yocto_base_files - yocto_outputs)
+                if missing_yocto:
+                    yocto_warnings.append(
+                        f"{machine}/{self.KERNEL_PROVIDER_YOCTO}: missing DT files "
+                        f"in kernel source: {', '.join(missing_yocto)}")
+
+            missing_qcom = sorted(qcom["dt_files"] - qcom_outputs[qcom["provider"]])
+            if missing_qcom:
+                errors.append(
+                    f"{machine}/{qcom['provider']}: missing DT files in kernel "
+                    f"source: {', '.join(missing_qcom)}")
+
+            missing_extra = sorted(qcom["extra_files"] - qcom["dt_files"])
+            if missing_extra:
+                errors.append(
+                    f"{machine}/{qcom['provider']}: LINUX_QCOM_KERNEL_DEVICETREE "
+                    f"not present in KERNEL_DEVICETREE: {', '.join(missing_extra)}")
+
+            if yocto is not None:
+                yocto_base_files = yocto["dt_files"] - yocto["extra_files"]
+                yocto_present_base = yocto_base_files & yocto_outputs
+                missing_base = sorted(yocto_present_base - qcom["dt_files"])
+                if missing_base:
+                    errors.append(
+                        f"{machine}/{qcom['provider']}: missing linux-yocto base DT files: "
+                        f"{', '.join(missing_base)}")
+
+        for warning in yocto_warnings:
+            logging.warning(warning)
+
+        if errors:
+            self.fail("\n".join(errors))
+
+    def test_fit_dtb_compatible_combos_exist_in_kernel_sources(self):
+        """Every FIT_DTB_COMPATIBLE value must name DT files present in kernel sources.
+
+        Base file entries are checked against the union of linux-yocto and qcom
+        kernel sources.  Entries from fit-dtb-compatible-linux-qcom.inc are
+        checked against qcom kernel sources only (they reference
+        LINUX_QCOM_KERNEL_DEVICETREE overlays not available in linux-yocto).
+        """
+        available = set(self._available_providers())
+
+        qcom_available = [p for p in self.KERNEL_PROVIDERS_QCOM if p in available]
+        self.assertGreater(
+            len(qcom_available), 0,
+            "No qcom kernel provider available (linux-qcom-next/linux-qcom)")
+
+        all_outputs = set()
+        for provider in [self.KERNEL_PROVIDER_YOCTO] + qcom_available:
+            all_outputs |= self._provider_output_files(provider)
+
+        qcom_outputs = set()
+        for provider in qcom_available:
+            qcom_outputs |= self._provider_output_files(provider)
+
+        def _check_combos(compat_map, output_files, label):
+            missing = []
+            for encoded_key, combo_val in compat_map.items():
+                parts = combo_val.split()
+                base = parts[0]
+                if len(parts) == 1:
+                    if not self._has_dt_output(output_files, base, (".dtb", ".dtbo")):
+                        missing.append(f"{encoded_key} -> {combo_val}  [{label}]")
+                    continue
+                if not self._has_dt_output(output_files, base, (".dtb",)):
+                    missing.append(f"{encoded_key} -> {combo_val}  [{label}]")
+                    continue
+                if any(not self._has_dt_output(output_files, ovl, (".dtbo",))
+                       for ovl in parts[1:]):
+                    missing.append(f"{encoded_key} -> {combo_val}  [{label}]")
+            return missing
+
+        missing = _check_combos(self._fit_compatible_map(), all_outputs, "base")
+
+        qcom_inc = self._linux_qcom_fit_compat_inc()
+        if os.path.exists(qcom_inc):
+            qcom_map = self._parse_fit_compatible_map(qcom_inc)
+            missing += _check_combos(qcom_map, qcom_outputs, "linux-qcom")
+
+        if missing:
+            self.fail(
+                "FIT_DTB_COMPATIBLE entries missing DTB/DTBO files in kernel sources:\n"
+                + "\n".join(sorted(missing)))
+
+    def test_fit_dtb_compatible_no_duplicate_keys(self):
+        """Each FIT_DTB_COMPATIBLE key must be defined exactly once per file.
+
+        Bitbake silently overwrites a flag variable when the same key is
+        assigned twice, dropping the first set of compatible strings without
+        any warning.
+        """
+        errors = []
+        for inc_path in (self._fit_compatible_inc(), self._linux_qcom_fit_compat_inc()):
+            if not os.path.exists(inc_path):
+                continue
+            key_re = re.compile(r'^\s*FIT_DTB_COMPATIBLE\[([^\]]+)\]\s*=')
+            seen = {}
+            with open(inc_path) as f:
+                for lineno, line in enumerate(f, 1):
+                    m = key_re.match(line)
+                    if m:
+                        key = m.group(1).strip()
+                        seen.setdefault(key, []).append(lineno)
+
+            fname = os.path.basename(inc_path)
+            for k, lines in sorted(seen.items()):
+                if len(lines) > 1:
+                    errors.append(
+                        f"  '{k}' in {fname} defined at lines: "
+                        f"{', '.join(str(l) for l in lines)}")
+
+        if errors:
+            self.fail(
+                "Duplicate FIT_DTB_COMPATIBLE keys:\n" + "\n".join(errors))
+
+    def test_fit_dtb_compatible_compat_key_format(self):
+        """Each FIT_DTB_COMPATIBLE key must be an encoded compatible string.
+
+        Keys encode the Device Tree compatible string with commas replaced by
+        underscores (BitBake flag names cannot contain commas).  Every key
+        must therefore start with the 'qcom_' prefix, ensuring the bbclass
+        can decode it back to a valid 'qcom,…' compatible string.
+        """
+        errors = []
+        for inc_path in (self._fit_compatible_inc(), self._linux_qcom_fit_compat_inc()):
+            if not os.path.exists(inc_path):
+                continue
+            fname = os.path.basename(inc_path)
+            for encoded_key in self._parse_fit_compatible_map(inc_path):
+                if not encoded_key.startswith("qcom_"):
+                    errors.append(
+                        f"  '{encoded_key}' in {fname}: must start with 'qcom_'")
+
+        if errors:
+            self.fail(
+                "FIT_DTB_COMPATIBLE keys must be encoded compatible strings "
+                "(qcom_<compat>):\n" + "\n".join(errors))
